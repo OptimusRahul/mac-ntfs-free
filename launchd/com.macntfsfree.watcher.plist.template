@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.macntfsfree.watcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLI_PATH__</string>
+        <string>daemon-tick</string>
+    </array>
+
+    <key>WatchPaths</key>
+    <array>
+        <string>/Volumes</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Library/Logs/mac-ntfs-free.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Library/Logs/mac-ntfs-free.log</string>
+</dict>
+</plist>

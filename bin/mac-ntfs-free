@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+#
+# mac-ntfs-free - free, open-source NTFS read/write for macOS, built on
+# macFUSE + ntfs-3g. See https://github.com/OptimusRahul/mac-ntfs-free
+#
+set -uo pipefail
+
+# Homebrew on Apple Silicon and Intel live in different prefixes, and
+# this script also runs as root under launchd (which has a minimal
+# PATH) - make sure ntfs-3g/diskutil/etc are always found.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:/sbin:${PATH:-}"
+
+PROG="$(basename "$0")"
+LOCK_DIR="/var/run/mac-ntfs-free"
+LOG_TAG="mac-ntfs-free"
+
+log() { logger -t "$LOG_TAG" -- "$*" 2>/dev/null; echo "$*"; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG <command>
+
+Commands:
+  status         Show macFUSE approval, ntfs-3g availability, daemon
+                 state, and current NTFS volumes (read-only vs read-write).
+  mount <name>   Manually remount one NTFS volume (as it appears under
+                 /Volumes) read-write via ntfs-3g. Prompts for sudo if
+                 not already root.
+  daemon-tick    Internal: scans /Volumes for read-only NTFS mounts and
+                 remounts them read-write. Invoked by the LaunchDaemon;
+                 not normally run by hand.
+EOF
+  exit 1
+}
+
+# ---------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------
+
+is_ntfs_readonly_line() {
+  # $1 = one line of `mount` output
+  [[ "$1" == *"(ntfs,"* ]] && [[ "$1" == *"read-only"* ]] && [[ "$1" == *"fskit"* ]]
+}
+
+is_fuse_mounted() {
+  # $1 = mount point path; returns true if already mounted via macfuse/fuse
+  mount | grep -F -- "on $1 (" | grep -qi -E "fuse"
+}
+
+mount_point_from_line() {
+  # extracts "/Volumes/Foo Bar" out of "/dev/diskXsY on /Volumes/Foo Bar (ntfs, ...)"
+  local line="$1"
+  line="${line#*on }"
+  line="${line% (*}"
+  echo "$line"
+}
+
+device_from_line() {
+  local line="$1"
+  echo "${line%% on *}"
+}
+
+do_mount_rw() {
+  # $1 = device node, $2 = mount point (with /Volumes/<name>)
+  local dev="$1" mp="$2" name
+  name="$(basename "$mp")"
+
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "This needs root to write to $dev - re-running with sudo."
+    exec sudo "$0" mount "$name"
+  fi
+
+  if ! command -v ntfs-3g >/dev/null 2>&1; then
+    echo "Error: ntfs-3g not found on PATH. Install with:" >&2
+    echo "  brew install --cask macfuse" >&2
+    echo "  brew tap gromgit/fuse && brew install ntfs-3g-mac" >&2
+    return 1
+  fi
+
+  log "Unmounting $mp (read-only) before remount"
+  diskutil unmount "$mp" >/dev/null 2>&1 || true
+
+  mkdir -p "$mp"
+  if ntfs-3g "$dev" "$mp" -o local,allow_other,auto_xattr,noatime,volname="$name" 2>&1; then
+    log "Mounted $dev at $mp read-write via ntfs-3g"
+    return 0
+  else
+    log "Failed to mount $dev at $mp via ntfs-3g"
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------
+
+cmd_status() {
+  echo "== macFUSE system extension =="
+  if systemextensionsctl list 2>/dev/null | grep -qi fuse; then
+    echo "  Approved."
+  else
+    echo "  NOT approved. Run 'mac-ntfs-free mount <VolumeName>' once to"
+    echo "  trigger the approval dialog, then allow it in System Settings"
+    echo "  > Privacy & Security, and re-run this installer."
+  fi
+
+  echo ""
+  echo "== ntfs-3g =="
+  if command -v ntfs-3g >/dev/null 2>&1; then
+    echo "  Found at $(command -v ntfs-3g)"
+  else
+    echo "  NOT found on PATH."
+  fi
+
+  echo ""
+  echo "== Watcher daemon =="
+  if launchctl print system/com.macntfsfree.watcher >/dev/null 2>&1; then
+    echo "  Loaded and running."
+  else
+    echo "  Not loaded. Re-run install.sh, or check /Library/LaunchDaemons."
+  fi
+
+  echo ""
+  echo "== NTFS volumes =="
+  local found=0
+  while IFS= read -r line; do
+    [[ "$line" == *"(ntfs,"* ]] || continue
+    found=1
+    local mp
+    mp="$(mount_point_from_line "$line")"
+    if [[ "$line" == *"read-only"* ]]; then
+      echo "  $mp  [READ-ONLY]"
+    else
+      echo "  $mp  [read-write]"
+    fi
+  done < <(mount)
+  [[ "$found" -eq 1 ]] || echo "  (none mounted)"
+}
+
+cmd_mount() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "Usage: $PROG mount <VolumeName>" >&2; exit 1; }
+  local mp="/Volumes/${name}"
+  [[ -d "$mp" ]] || { echo "Error: '$mp' not found." >&2; exit 1; }
+
+  local dev
+  dev="$(diskutil info "$mp" | awk -F': *' '/Device Node/ {print $2}')"
+  [[ -n "$dev" ]] || { echo "Error: couldn't resolve device node for '$mp'." >&2; exit 1; }
+
+  do_mount_rw "$dev" "$mp"
+}
+
+cmd_daemon_tick() {
+  # Meant to run as root via launchd. Serialize concurrent ticks.
+  mkdir -p "$LOCK_DIR"
+  exec 9>"$LOCK_DIR/tick.lock"
+  flock -n 9 || exit 0   # another tick already running; skip
+
+  while IFS= read -r line; do
+    is_ntfs_readonly_line "$line" || continue
+    local mp dev name failmarker
+    mp="$(mount_point_from_line "$line")"
+    dev="$(device_from_line "$line")"
+    name="$(basename "$mp")"
+    failmarker="$LOCK_DIR/$(echo "$name" | tr -c 'A-Za-z0-9_-' '_').failed"
+
+    if is_fuse_mounted "$mp"; then
+      continue
+    fi
+
+    # Don't hammer a volume that failed recently (e.g. unsupported/corrupt).
+    if [[ -f "$failmarker" ]]; then
+      local age
+      age=$(( $(date +%s) - $(stat -f %m "$failmarker" 2>/dev/null || echo 0) ))
+      [[ "$age" -lt 300 ]] && continue
+    fi
+
+    log "Detected read-only NTFS mount: $mp ($dev) - remounting read-write"
+    if do_mount_rw "$dev" "$mp"; then
+      rm -f "$failmarker"
+    else
+      touch "$failmarker"
+    fi
+  done < <(mount)
+}
+
+# ---------------------------------------------------------------------
+
+case "${1:-}" in
+  status)       cmd_status ;;
+  mount)        shift; cmd_mount "${1:-}" ;;
+  daemon-tick)  cmd_daemon_tick ;;
+  *)            usage ;;
+esac
