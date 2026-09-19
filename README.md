@@ -94,10 +94,12 @@ Everything else is automatic via the background watcher.
   common cause is a dirty NTFS journal — plug the drive into a Windows
   PC once and let it run `chkdsk`, or eject cleanly rather than
   yanking it in future).
-- **"macFUSE is out of date" / version mismatch error** — both
-  `./install.sh` and `mac-ntfs-free mount "<Name>"` now detect an
-  outdated macFUSE and run `brew upgrade --cask macfuse` for you
-  automatically before mounting. If macOS then shows a fresh system
+- **"macFUSE is out of date" / version mismatch error** — macFUSE and
+  ntfs-3g-mac must stay in version lockstep (ntfs-3g-mac is built
+  against macFUSE's headers/library), so re-run `./install.sh`: it
+  detects whichever one is outdated — including macFUSE, whose cask is
+  marked `auto_updates` so a plain `brew outdated` misses it — and
+  upgrades it automatically. If macOS then shows a fresh system
   extension approval dialog, allow it and re-run the command — a
   macFUSE upgrade sometimes requires re-approval even if it was
   approved before.
